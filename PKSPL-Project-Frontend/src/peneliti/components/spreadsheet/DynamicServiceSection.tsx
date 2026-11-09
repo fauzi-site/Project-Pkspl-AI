@@ -1,0 +1,1705 @@
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { useSpreadsheet } from '../../context/SpreadsheetContext';
+import { useProject } from '../../context/ProjectContext';
+import { getMethodSchema, ColumnDefinition, CustomColumnDefinition, CustomColumnType, getFaunaRowUnits } from '../../types/methodSchemas';
+import { ECOSYSTEM_SERVICES_CONFIG } from '../../mock/valuationMock';
+import { downloadContextTemplate, TemplateFileFormat } from '../../utils/excelEngine';
+import { formatIDR } from '../../utils/formatter';
+import { getProjectDataMaster } from '../../../services/dataMasterService';
+import { CustomColumnModal } from './CustomColumnModal';
+import { DeleteColumnConfirmModal } from './DeleteColumnConfirmModal';
+import { FormattedNumberInput } from './FormattedNumberInput';
+import { MasterBiotaWarningModal } from './MasterBiotaWarningModal';
+import {
+  ChevronDown,
+  ChevronUp,
+  Plus,
+  Download,
+  Upload,
+  Trash2,
+  Columns3,
+  Pencil,
+  Lock,
+  FileSpreadsheet,
+  FileText,
+  FileCode,
+  HelpCircle,
+  Undo2,
+  AlertTriangle,
+  Sparkles,
+  Check
+} from 'lucide-react';
+import { useAuth } from '../../../contexts/AuthContext';
+import { RespondentDetailModal } from './RespondentDetailModal';
+
+interface DynamicServiceSectionProps {
+  projectId?: string;
+  prefixLetter: 'A' | 'B' | 'C' | 'D';
+  serviceId: 'provisioning' | 'regulating' | 'supporting' | 'cultural';
+  serviceName: string;
+  methodId?: string;
+  activeMethodIds?: string[];
+  biota?: 'flora' | 'fauna';
+  areaId: string;
+  areaName: string;
+  areaHa: number;
+  isOpen: boolean;
+  onToggleOpen: () => void;
+  onMethodChange?: (newMethodId: string) => void;
+  onBiotaChange?: (newBiota: 'flora' | 'fauna') => void;
+  onOpenImportModal: (service: string, method: string, category: string) => void;
+  highlightedRowId?: string | null;
+}
+
+/** Kategori Data Master untuk tiap layanan ekosistem. */
+type MasterCategory = 'Provisioning' | 'Regulating' | 'Supporting' | 'Cultural';
+const SERVICE_MASTER_CATEGORY: Record<string, MasterCategory> = {
+  provisioning: 'Provisioning',
+  regulating: 'Regulating',
+  supporting: 'Supporting',
+  cultural: 'Cultural',
+};
+/** Metode yang kolom namanya bukan entri katalog master (mis. skenario kebijakan), jadi tanpa peringatan. */
+const METHODS_WITHOUT_MASTER = new Set(['choice-experiment']);
+
+interface BiotaAutocompleteProps {
+  value: string;
+  onChange: (v: string) => void;
+  options: any[];
+  /** Seluruh master provisioning (flora + fauna) untuk pengecekan keberadaan nama. */
+  allOptions?: any[];
+  /** Peringatan hanya ditampilkan setelah master selesai dimuat. */
+  masterStatus?: 'idle' | 'loading' | 'ready' | 'error';
+  placeholder?: string;
+  isHighlighted?: boolean;
+  activeLocation?: string;
+  onRequestAddMaster?: (typedValue: string, bType: 'flora' | 'fauna') => void;
+  biotaType: 'flora' | 'fauna';
+  /** Tampilkan nama latin pada saran/label (hanya relevan untuk provisioning). */
+  showLatin?: boolean;
+}
+
+const BiotaAutocomplete: React.FC<BiotaAutocompleteProps> = ({
+  value,
+  onChange,
+  options,
+  allOptions,
+  masterStatus = 'ready',
+  placeholder,
+  isHighlighted,
+  activeLocation,
+  onRequestAddMaster,
+  biotaType = 'flora',
+  showLatin = true,
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // Nilai yang dievaluasi untuk peringatan. Saat pengguna mengetik, evaluasi ditunda 600 ms;
+  // nilai dari luar (data yang dimuat/di-refresh) dievaluasi langsung.
+  const [checkedValue, setCheckedValue] = useState(value || '');
+  const typingRef = useRef(false);
+
+  useEffect(() => {
+    if (!typingRef.current) {
+      setCheckedValue(value || '');
+      return;
+    }
+    const timer = setTimeout(() => {
+      typingRef.current = false;
+      setCheckedValue(value || '');
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [value]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const filteredOptions = React.useMemo(() => {
+    let locationFiltered = options;
+    if (activeLocation) {
+      const projLoc = activeLocation.toLowerCase();
+      const matched = options.filter((opt) => {
+        const optLoc = (opt.daerah || opt.apiData?.daerah || '').toLowerCase();
+        return optLoc && (optLoc.includes(projLoc) || projLoc.includes(optLoc));
+      });
+      if (matched.length > 0) locationFiltered = matched;
+    }
+
+    return locationFiltered
+      .filter((opt) => {
+        const namaIndo = opt.namaIndonesia || opt.nama_indonesia || opt.apiData?.namaIndonesia || '';
+        const namaLatin = opt.namaLatin || opt.nama_latin || opt.apiData?.namaLatin || '';
+        const label = showLatin && namaLatin && namaLatin !== '-' ? `${namaIndo} (${namaLatin})` : namaIndo;
+        if (!label) return false;
+
+        if (!value) return true;
+        const lowerVal = value.toLowerCase().trim();
+        const lowerLabel = label.toLowerCase();
+        const lowerIndo = namaIndo.toLowerCase();
+        const lowerLatin = showLatin ? namaLatin.toLowerCase() : '';
+
+        return (
+          lowerLabel.includes(lowerVal) ||
+          lowerIndo.includes(lowerVal) ||
+          lowerLatin.includes(lowerVal)
+        );
+      })
+      .slice(0, 10);
+  }, [options, value, activeLocation]);
+
+  // Evaluasi apakah nilai yang sedang terisi ADA di dalam Data Master
+  const isValueInMaster = (valToCheck: string) => {
+    const trimmed = (valToCheck || '').trim().toLowerCase();
+    if (!trimmed) return true;
+
+    return (allOptions ?? options).some((opt) => {
+      const namaIndo = (opt.namaIndonesia || opt.nama_indonesia || opt.apiData?.namaIndonesia || '').trim().toLowerCase();
+      const namaLatin = (opt.namaLatin || opt.nama_latin || opt.apiData?.namaLatin || '').trim().toLowerCase();
+      const namaDaerah = (opt.namaDaerah || opt.nama_daerah || opt.apiData?.namaDaerah || '').trim().toLowerCase();
+      const label = (showLatin && namaLatin && namaLatin !== '-' ? `${namaIndo} (${namaLatin})` : namaIndo).toLowerCase();
+
+      return (
+        trimmed === namaIndo ||
+        (showLatin && namaLatin !== '-' && trimmed === namaLatin) ||
+        (showLatin && namaDaerah !== '-' && trimmed === namaDaerah) ||
+        trimmed === label
+      );
+    });
+  };
+
+  // Diturunkan dari data (bukan state), sehingga tetap benar setelah refresh.
+  const showWarningIndicator =
+    masterStatus === 'ready' && checkedValue.trim().length >= 3 && !isValueInMaster(checkedValue);
+
+  const settleNow = () => {
+    typingRef.current = false;
+    setCheckedValue(value || '');
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    typingRef.current = true;
+    onChange(e.target.value);
+    setIsOpen(true);
+  };
+
+  const handleInputBlur = () => {
+    settleNow();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      setIsOpen(false);
+      settleNow();
+    }
+  };
+
+  const handleWarningClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (onRequestAddMaster && value?.trim()) {
+      onRequestAddMaster(value.trim(), biotaType);
+    }
+  };
+
+  return (
+    <div ref={wrapperRef} className="relative w-full flex items-center">
+      <input
+        type="text"
+        value={value || ''}
+        onChange={handleInputChange}
+        onBlur={handleInputBlur}
+        onKeyDown={handleKeyDown}
+        onFocus={() => setIsOpen(true)}
+        placeholder={placeholder}
+        className={`w-full px-2 py-1 bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border font-medium ${
+          showWarningIndicator ? 'pr-7 ' : ''
+        }${
+          isHighlighted
+            ? 'border-rose-400 bg-rose-50 text-rose-800'
+            : 'border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800'
+        }`}
+      />
+
+      {/* Indikator Warning Kecil di Sebelah Kanan Kolom Input */}
+      {showWarningIndicator && (
+        <button
+          type="button"
+          onClick={handleWarningClick}
+          className="absolute right-1.5 p-1 rounded-md text-amber-500 hover:text-amber-700 hover:bg-amber-100 transition-colors cursor-pointer group shrink-0"
+          title="Data belum tersedia di Data Master. Klik untuk melihat detail."
+          aria-label="Peringatan: Data belum tersedia di Data Master. Klik untuk melihat detail."
+        >
+          <AlertTriangle className="w-3.5 h-3.5 stroke-[2.2]" />
+          <span className="sr-only">Data belum tersedia di Data Master. Klik untuk melihat detail.</span>
+        </button>
+      )}
+
+      {/* Autocomplete Dropdown List */}
+      {isOpen && filteredOptions.length > 0 && (
+        <ul className="absolute left-0 top-full z-50 w-full mt-1 bg-white border border-slate-200 rounded-md shadow-lg max-h-48 overflow-y-auto text-xs font-medium text-slate-700">
+          {filteredOptions.map((opt, i) => {
+            const namaIndo = opt.namaIndonesia || opt.nama_indonesia || opt.apiData?.namaIndonesia || '';
+            const namaLatin = opt.namaLatin || opt.nama_latin || opt.apiData?.namaLatin || '';
+            const label = showLatin && namaLatin && namaLatin !== '-' ? `${namaIndo} (${namaLatin})` : namaIndo;
+            return (
+              <li
+                key={i}
+                onClick={() => {
+                  typingRef.current = false;
+                  onChange(label);
+                  setIsOpen(false);
+                }}
+                className="px-3 py-2 cursor-pointer hover:bg-blue-50 hover:text-blue-700 border-b border-slate-100 last:border-0"
+              >
+                <div className="flex flex-col">
+                  <span>{namaIndo}</span>
+                  {showLatin && namaLatin && namaLatin !== '-' && (
+                    <span className="text-[10px] text-slate-400 italic font-normal">{namaLatin}</span>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+};
+
+/** Source label written when a figure comes from the per-respondent pop-up. */
+const DERIVED_SOURCE_PREFIX = 'Dari ';
+
+/** The one column per method that the respondent pop-up fills in. */
+const isRespondentDerivedColumn = (methodId: string, colKey: string) =>
+  (methodId === 'tcm' && colKey === 'biayaPerjalanan') || (methodId === 'cvm' && colKey === 'wtp');
+
+/** Tooltip for the columns the respondent pop-up touches (or deliberately leaves alone). */
+const DERIVED_COLUMN_HELP: Record<string, string> = {
+  'tcm:biayaPerjalanan': 'Terisi otomatis bila Anda menginput responden lewat tombol "Input Responden" dan menekan Simpan & Hitung. Menyimpan lagi akan menghitung ulang dan menimpa angka ini. Boleh juga diisi manual; keterangan Sumber Data akan berubah menjadi "Diisi manual".',
+  'tcm:kunjungan': 'Tidak terisi otomatis dari input responden. Isi sendiri total kunjungan seluruh kawasan dalam setahun; Total Nilai = kolom ini × Surplus Konsumen.',
+  'cvm:wtp': 'Terisi otomatis bila Anda menginput responden lewat tombol "Input Responden" dan menekan Simpan & Hitung. Menyimpan lagi akan menghitung ulang dan menimpa angka ini. Boleh juga diisi manual; keterangan Sumber Data akan berubah menjadi "Diisi manual".',
+  'cvm:populasi': 'Tidak terisi otomatis dari input responden. Isi sendiri jumlah populasi yang relevan; Total Nilai = kolom ini × Rata-rata WTP.',
+};
+
+export const DynamicServiceSection: React.FC<DynamicServiceSectionProps> = ({
+  projectId,
+  prefixLetter,
+  serviceId,
+  serviceName,
+  methodId,
+  activeMethodIds,
+  biota = 'flora',
+  areaId,
+  areaName,
+  areaHa,
+  isOpen,
+  onToggleOpen,
+  onOpenImportModal,
+  highlightedRowId,
+}) => {
+  const { activeProjectId, activeProject } = useProject();
+  const { user } = useAuth() || {};
+  const roleName = (user?.role?.nama_role || (typeof user?.role === 'string' ? user.role : '')).toLowerCase();
+  const isAdmin = roleName.includes('admin');
+  const currentProjId = projectId || activeProjectId;
+
+  const {
+    getRows,
+    updateCell,
+    addRow,
+    deleteRow,
+    deletedRows,
+    restoreRow,
+    discardDeletedRow,
+    getCustomColumns,
+    addCustomColumn,
+    updateCustomColumn,
+    deleteCustomColumn,
+  } = useSpreadsheet();
+
+  // Resolve active methods to render vertically
+  const defaultFallbackMethod = serviceId === 'provisioning' ? 'market-price'
+    : serviceId === 'regulating' ? 'replacement-cost'
+    : serviceId === 'supporting' ? 'nursery-ground'
+    : 'tcm';
+
+  const methodsToRender = useMemo(() => {
+    if (activeMethodIds && activeMethodIds.length > 0) {
+      return activeMethodIds;
+    }
+    if (methodId) {
+      return [methodId];
+    }
+    return [defaultFallbackMethod];
+  }, [activeMethodIds, methodId, defaultFallbackMethod]);
+
+  // Modal states for Custom Columns (tracking active target methodId)
+  const [activeModalMethodId, setActiveModalMethodId] = useState<string>(methodsToRender[0]);
+  const [isColumnModalOpen, setIsColumnModalOpen] = useState(false);
+  const [editingColumn, setEditingColumn] = useState<CustomColumnDefinition | null>(null);
+  const [deletingColumn, setDeletingColumn] = useState<CustomColumnDefinition | null>(null);
+
+  // Row whose per-respondent detail is open (TCM / CVM two-stage input).
+  const [detailTarget, setDetailTarget] = useState<{ method: 'tcm' | 'cvm'; rowId: string } | null>(null);
+
+  // Modal states for import/download dropdowns in provisioning per method card
+  const [importDropdownOpen, setImportDropdownOpen] = useState<Record<string, boolean>>({});
+  const [downloadDropdownOpen, setDownloadDropdownOpen] = useState<Record<string, boolean>>({});
+
+  // Data Master Autocomplete State (Murni dari Data Master, tanpa mock hardcoded)
+  // Seluruh item Data Master untuk kategori layanan ini (provisioning/regulating/supporting/cultural).
+  const [masterItems, setMasterItems] = useState<any[]>([]);
+  const masterCategory = SERVICE_MASTER_CATEGORY[serviceId];
+  // Provisioning dipilah flora/fauna menurut kategori yang tersimpan di master.
+  const masterBiotaList = useMemo(
+    () => ({
+      flora: masterItems.filter((item: any) => item.biota_type !== 'fauna'),
+      fauna: masterItems.filter((item: any) => item.biota_type === 'fauna'),
+    }),
+    [masterItems]
+  );
+  // Peringatan "belum ada di master" hanya valid setelah master selesai dimuat.
+  const [masterStatus, setMasterStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+
+  // Quick Add Master Biota Modal State
+  const [isAddMasterModalOpen, setIsAddMasterModalOpen] = useState(false);
+  const [addMasterCandidate, setAddMasterCandidate] = useState<{
+    name: string;
+    category: MasterCategory;
+    biotaType: 'flora' | 'fauna';
+    targetMethodId?: string;
+    rowId?: string;
+  }>({
+    name: '',
+    category: 'Provisioning',
+    biotaType: 'flora',
+  });
+
+  const loadProjectDataMaster = () => {
+    if (!masterCategory || !currentProjId) return;
+
+    setMasterStatus('loading');
+    getProjectDataMaster(currentProjId)
+      .then((res: any) => {
+        // Backend mengirim daftar datar di `data`, tiap item punya `category`.
+        const items: any[] | undefined = Array.isArray(res?.data)
+          ? res.data.filter((item: any) => item.category === masterCategory)
+          : res?.data?.[masterCategory.toLowerCase()] || res?.[masterCategory.toLowerCase()];
+
+        if (!Array.isArray(items)) {
+          setMasterItems([]);
+          setMasterStatus('error');
+          return;
+        }
+
+        setMasterItems(items);
+        setMasterStatus('ready');
+      })
+      .catch(() => {
+        setMasterItems([]);
+        setMasterStatus('error');
+      });
+  };
+
+  useEffect(() => {
+    if (masterCategory && isOpen) {
+      loadProjectDataMaster();
+    }
+  }, [serviceId, currentProjId, isOpen]);
+
+  const handleRequestAddMaster = (
+    name: string,
+    bType: 'flora' | 'fauna',
+    targetMethodId?: string,
+    rowId?: string
+  ) => {
+    setAddMasterCandidate({ name, category: masterCategory || 'Provisioning', biotaType: bType, targetMethodId, rowId });
+    setIsAddMasterModalOpen(true);
+  };
+
+  const handleMasterAdded = (createdItem: any) => {
+    loadProjectDataMaster();
+    // Jika ada rowId dan targetMethodId, simpan referensi ID data master ke baris valuasi
+    if (addMasterCandidate.rowId && addMasterCandidate.targetMethodId) {
+      const rowId = addMasterCandidate.rowId;
+      const tMethodId = addMasterCandidate.targetMethodId;
+      // Baris non-provisioning tidak dipilah flora/fauna (kunci 'none').
+      const bType = addMasterCandidate.category === 'Provisioning' ? addMasterCandidate.biotaType : 'none';
+      const masterId = createdItem?.id || createdItem?.raw_id;
+      if (masterId) {
+        updateCell(
+          currentProjId,
+          areaId,
+          serviceId,
+          tMethodId,
+          bType,
+          rowId,
+          {
+            data_master_id: masterId,
+            item: createdItem.nama_indonesia || addMasterCandidate.name,
+            ...(addMasterCandidate.category === 'Provisioning'
+              ? {
+                  nama_latin: createdItem.nama_latin && createdItem.nama_latin !== '-' ? createdItem.nama_latin : undefined,
+                  nama_daerah: createdItem.nama_daerah && createdItem.nama_daerah !== '-' ? createdItem.nama_daerah : undefined,
+                }
+              : {}),
+          }
+        );
+      }
+    }
+  };
+
+  // Category visual accent tokens
+  const ACCENT_STYLES: Record<string, { badgeBg: string; badgeText: string; borderLeft: string; pillBg: string; pillText: string }> = {
+    provisioning: { badgeBg: 'bg-cyan-100', badgeText: 'text-cyan-800', borderLeft: 'border-l-cyan-600', pillBg: 'bg-cyan-50', pillText: 'text-cyan-700' },
+    regulating: { badgeBg: 'bg-blue-100', badgeText: 'text-blue-800', borderLeft: 'border-l-blue-600', pillBg: 'bg-blue-50', pillText: 'text-blue-700' },
+    supporting: { badgeBg: 'bg-purple-100', badgeText: 'text-purple-800', borderLeft: 'border-l-purple-600', pillBg: 'bg-purple-50', pillText: 'text-purple-700' },
+    cultural: { badgeBg: 'bg-amber-100', badgeText: 'text-amber-800', borderLeft: 'border-l-amber-600', pillBg: 'bg-amber-50', pillText: 'text-amber-700' },
+  };
+
+  const accent = ACCENT_STYLES[serviceId] || ACCENT_STYLES.provisioning;
+
+  // Available methods for this service from master config
+  const serviceConfig = ECOSYSTEM_SERVICES_CONFIG.find(s => s.id === serviceId);
+  const availableMethodsConfig = serviceConfig?.methods || [];
+
+  // Calculation helper: Row Economic Value for a specific method
+  const getRowTotal = (row: Record<string, any>, rowBiota?: 'flora' | 'fauna', targetMethodId?: string): number => {
+    if (row.totalNilai !== undefined && row.totalNilai !== null && !isNaN(Number(row.totalNilai)) && Number(row.totalNilai) > 0) {
+      return Number(row.totalNilai);
+    }
+    const targetM = targetMethodId || methodsToRender[0];
+    const currentSchema = serviceId === 'provisioning'
+      ? getMethodSchema(serviceId, targetM, rowBiota || (biota === 'fauna' ? 'fauna' : 'flora'))
+      : getMethodSchema(serviceId, targetM);
+    const calc = currentSchema.calculateRow(row);
+    return (calc && typeof calc.total === 'number' && !isNaN(calc.total)) ? calc.total : 0;
+  };
+
+  // Compute category item count across all vertical method cards
+  const categoryItemCount = useMemo(() => {
+    let count = 0;
+    methodsToRender.forEach(mId => {
+      if (serviceId === 'provisioning') {
+        const fl = getRows(currentProjId, areaId, serviceId, mId, 'flora');
+        const fa = getRows(currentProjId, areaId, serviceId, mId, 'fauna');
+        count += (fl.length + fa.length);
+      } else {
+        const r = getRows(currentProjId, areaId, serviceId, mId, 'none');
+        count += r.length;
+      }
+    });
+    return count;
+  }, [methodsToRender, serviceId, currentProjId, areaId, getRows]);
+
+  // Custom Column Handlers
+  const handleSaveCustomColumn = (data: { label: string; type: CustomColumnType; required?: boolean }) => {
+    const targetMethodId = activeModalMethodId || methodsToRender[0];
+    if (editingColumn) {
+      const colIdentifier = editingColumn.key || editingColumn.id;
+      if (serviceId === 'provisioning') {
+        updateCustomColumn(currentProjId, areaId, serviceId, targetMethodId, 'flora', colIdentifier, data);
+        updateCustomColumn(currentProjId, areaId, serviceId, targetMethodId, 'fauna', colIdentifier, data);
+      } else {
+        updateCustomColumn(currentProjId, areaId, serviceId, targetMethodId, undefined, colIdentifier, data);
+      }
+    } else {
+      if (serviceId === 'provisioning') {
+        const rawKey = data.label.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+        const sharedKey = `c_${rawKey || 'col'}_${Date.now().toString(36)}`;
+        const sharedId = `col-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+        const colPayload = { ...data, key: sharedKey, id: sharedId };
+
+        addCustomColumn(currentProjId, areaId, serviceId, targetMethodId, 'flora', colPayload);
+        addCustomColumn(currentProjId, areaId, serviceId, targetMethodId, 'fauna', colPayload);
+      } else {
+        addCustomColumn(currentProjId, areaId, serviceId, targetMethodId, undefined, data);
+      }
+    }
+    setEditingColumn(null);
+    setIsColumnModalOpen(false);
+  };
+
+  const handleConfirmDeleteColumn = () => {
+    const targetMethodId = activeModalMethodId || methodsToRender[0];
+    if (deletingColumn) {
+      const colIdOrKey = deletingColumn.id || deletingColumn.key;
+      if (serviceId === 'provisioning') {
+        deleteCustomColumn(currentProjId, areaId, serviceId, targetMethodId, 'flora', colIdOrKey, deletingColumn.key);
+        deleteCustomColumn(currentProjId, areaId, serviceId, targetMethodId, 'fauna', colIdOrKey, deletingColumn.key);
+      } else {
+        deleteCustomColumn(currentProjId, areaId, serviceId, targetMethodId, undefined, colIdOrKey, deletingColumn.key);
+      }
+      setDeletingColumn(null);
+    }
+  };
+
+  const handleAddRow = (targetMethodId: string, targetBiota?: 'flora' | 'fauna') => {
+    const b = serviceId === 'provisioning' ? (targetBiota || 'flora') : 'none';
+    addRow(currentProjId, areaId, serviceId, targetMethodId, b, areaHa);
+  };
+
+  // Undo: a deletion shows a bar for a while; older ones stay in the "Terhapus" list of each table.
+  const [undoToast, setUndoToast] = useState<{ token: string; label: string } | null>(null);
+  const [deletedMenuOpen, setDeletedMenuOpen] = useState<Record<string, boolean>>({});
+
+  const handleDeleteRow = async (targetMethodId: string, rowId: string, targetBiota?: 'flora' | 'fauna') => {
+    const b = serviceId === 'provisioning' ? (targetBiota || 'flora') : 'none';
+    const row = getRows(currentProjId, areaId, serviceId, targetMethodId, b).find((r) => r.id === rowId);
+    const token = await deleteRow(currentProjId, areaId, serviceId, targetMethodId, b, rowId);
+    if (token) setUndoToast({ token, label: String(row?.item || row?.nama || 'Baris') });
+  };
+
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = setTimeout(() => setUndoToast(null), 15000);
+    return () => clearTimeout(timer);
+  }, [undoToast]);
+
+  const deletedHere = (mId: string) =>
+    deletedRows.filter(
+      (e) => String(e.projectId) === String(currentProjId) && String(e.areaId) === String(areaId) && e.serviceId === serviceId && e.methodId === mId,
+    );
+
+  // Ctrl/Cmd+Z restores the latest deleted row of this section, unless the researcher is typing in a field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'z' || e.shiftKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+      const latest = deletedRows.find(
+        (d) => String(d.projectId) === String(currentProjId) && String(d.areaId) === String(areaId) && d.serviceId === serviceId,
+      );
+      if (!latest) return;
+      e.preventDefault();
+      restoreRow(latest.token).then(() => setUndoToast(null));
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [deletedRows, currentProjId, areaId, serviceId, restoreRow]);
+
+  const handleCellChange = (targetMethodId: string, rowId: string, colKey: string, val: any, targetBiota?: 'flora' | 'fauna') => {
+    const b = serviceId === 'provisioning' ? (targetBiota || 'flora') : 'none';
+    // Typing over a figure that came from respondent data makes it a manual one; say so in Sumber Data.
+    if (isRespondentDerivedColumn(targetMethodId, colKey)) {
+      const row = getRows(currentProjId, areaId, serviceId, targetMethodId, undefined).find((r) => r.id === rowId);
+      if (String(row?.source || '').startsWith(DERIVED_SOURCE_PREFIX)) {
+        updateCell(currentProjId, areaId, serviceId, targetMethodId, b, rowId, { [colKey]: val, source: 'Diisi manual', detail: null });
+        return;
+      }
+    }
+    updateCell(currentProjId, areaId, serviceId, targetMethodId, b, rowId, colKey, val);
+  };
+
+  const handleDownloadTemplate = (targetMethodId: string, format: TemplateFileFormat = 'xlsx') => {
+    downloadContextTemplate(
+      serviceId,
+      targetMethodId,
+      serviceId === 'provisioning' ? (biota === 'fauna' ? 'Fauna' : 'Flora') : 'General',
+      format
+    );
+  };
+
+  // Render Table Row Helper for a specific method
+  const renderRow = (
+    row: Record<string, any>,
+    rIdx: number,
+    targetMethodId: string,
+    systemColumns: ColumnDefinition[],
+    combinedCustomCols: CustomColumnDefinition[],
+    rowBiota?: 'flora' | 'fauna'
+  ) => {
+    const isHighlighted = highlightedRowId === row.id || highlightedRowId === String(row.no);
+
+    return (
+      <React.Fragment key={row.id || `${rowBiota || 'row'}-${rIdx}`}>
+      <tr
+        className={`hover:bg-blue-50/30 transition-colors ${
+          isHighlighted ? 'bg-rose-50 border-2 border-rose-500' : ''
+        }`}
+      >
+        <td className="py-2 px-3 text-center font-mono text-slate-400 border-r border-slate-200 bg-slate-50/50">
+          {rIdx + 1}
+        </td>
+
+        {/* 1. System Column Cells */}
+        {systemColumns.map((col: ColumnDefinition) => {
+          const val = row[col.key];
+
+          if (col.key === 'totalNilai' || col.type === 'readonly_calculated') {
+            const targetM = targetMethodId || methodsToRender[0];
+            const currentSchema = serviceId === 'provisioning'
+              ? getMethodSchema(serviceId, targetM, rowBiota || (biota === 'fauna' ? 'fauna' : 'flora'))
+              : getMethodSchema(serviceId, targetM);
+            const calc = currentSchema.calculateRow(row);
+
+            if (calc.isPendingQuantity) {
+              return (
+                <td
+                  key={col.key}
+                  className="py-2 px-3 border-r border-slate-200 text-center bg-amber-50/50"
+                  title={calc.pendingReason || 'Data kuantitas / volume belum tersedia'}
+                >
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-100 text-amber-800 border border-amber-300 shadow-2xs">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                    Belum dapat dihitung
+                  </span>
+                </td>
+              );
+            }
+
+            return (
+              <td
+                key={col.key}
+                className="py-2 px-3 border-r border-slate-200 text-right bg-slate-50 font-mono font-bold text-slate-900 select-all"
+              >
+                {formatIDR(getRowTotal(row, rowBiota, targetMethodId))}
+              </td>
+            );
+          }
+
+          if (col.type === 'number') {
+            let placeholderText = col.placeholder || '0';
+            if (serviceId === 'provisioning') {
+              if (rowBiota === 'fauna') {
+                const faunaUnits = getFaunaRowUnits(row);
+                if (col.key === 'produktivitas') {
+                  placeholderText = faunaUnits.prodPlaceholder;
+                } else if (col.key === 'jumlah') {
+                  placeholderText = faunaUnits.qtyPlaceholder;
+                } else if (col.key === 'hargaUnit') {
+                  placeholderText = faunaUnits.pricePlaceholder;
+                }
+              } else {
+                if (col.key === 'produktivitas') {
+                  placeholderText = '0 (m³/ha)';
+                } else if (col.key === 'jumlah') {
+                  placeholderText = '0 (m³ kayu)';
+                } else if (col.key === 'hargaUnit') {
+                  placeholderText = 'Rp/m³';
+                }
+              }
+            }
+            return (
+              <td key={col.key} className="py-1 px-2 border-r border-slate-200 text-right">
+                <FormattedNumberInput
+                  key={`${row.id}-${col.key}`}
+                  value={val}
+                  onChange={(numVal) => handleCellChange(targetMethodId, row.id, col.key, numVal, rowBiota)}
+                  placeholder={placeholderText}
+                  decimals={2}
+                  className={`w-full px-2 py-1 text-right bg-transparent hover:bg-white focus:bg-white focus:ring-1 rounded border font-mono ${
+                    isHighlighted && (col.key === 'hargaUnit' || col.key === 'hargaOutput')
+                      ? 'border-rose-400 bg-rose-50 text-rose-800 font-bold focus:ring-rose-500'
+                      : 'border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800'
+                  }`}
+                />
+                {serviceId === 'cultural' && isRespondentDerivedColumn(targetMethodId, col.key) && String(row.source || '').startsWith(DERIVED_SOURCE_PREFIX) && (
+                  <div className="mt-0.5 text-[10px] leading-tight text-right text-indigo-600" title="Angka ini dihitung dari data responden. Mengetik ulang akan menjadikannya manual.">
+                    {String(row.source)}
+                  </div>
+                )}
+              </td>
+            );
+          }
+
+          const isBiotaItem =
+            col.key === 'item' && !!masterCategory && !METHODS_WITHOUT_MASTER.has(targetMethodId || '');
+          
+          return (
+            <td key={col.key} className="py-1 px-2 border-r border-slate-200">
+              {isBiotaItem ? (
+                <BiotaAutocomplete
+                  value={val || ''}
+                  onChange={(v) => handleCellChange(targetMethodId, row.id, col.key, v, rowBiota)}
+                  options={
+                    serviceId !== 'provisioning'
+                      ? masterItems
+                      : rowBiota === 'fauna'
+                      ? masterBiotaList.fauna
+                      : masterBiotaList.flora
+                  }
+                  allOptions={masterItems}
+                  masterStatus={masterStatus}
+                  showLatin={serviceId === 'provisioning'}
+                  placeholder={
+                    serviceId !== 'provisioning'
+                      ? col.placeholder
+                      : rowBiota === 'fauna'
+                      ? 'Contoh: Ikan Tongkol, Kepiting Bakau (Scylla serrata)'
+                      : 'Contoh: Rhizophora apiculata'
+                  }
+                  isHighlighted={isHighlighted}
+                  activeLocation={activeProject?.location}
+                  biotaType={rowBiota === 'fauna' ? 'fauna' : 'flora'}
+                  onRequestAddMaster={(typedVal, bType) =>
+                    handleRequestAddMaster(typedVal, bType, targetMethodId, row.id)
+                  }
+                />
+              ) : (
+                <input
+                  key={`${row.id}-${col.key}`}
+                  type="text"
+                  value={val || ''}
+                  onChange={(e) => handleCellChange(targetMethodId, row.id, col.key, e.target.value, rowBiota)}
+                  placeholder={col.placeholder || ''}
+                  className="w-full px-2 py-1 bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800 font-medium"
+                />
+              )}
+            </td>
+          );
+        })}
+
+        {/* 2. Custom Column Cells */}
+        {combinedCustomCols.map((col: CustomColumnDefinition) => {
+          const val = row[col.key];
+
+          if (col.type === 'integer') {
+            return (
+              <td key={col.key} className="py-1 px-2 border-r border-slate-200 text-right">
+                <FormattedNumberInput
+                  key={`${row.id}-${col.key}`}
+                  value={val}
+                  isIntegerOnly={true}
+                  decimals={0}
+                  onChange={(numVal) => handleCellChange(targetMethodId, row.id, col.key, numVal, rowBiota)}
+                  placeholder="0"
+                  className="w-full px-2 py-1 text-right bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800 font-mono"
+                />
+              </td>
+            );
+          }
+
+          if (col.type === 'decimal') {
+            return (
+              <td key={col.key} className="py-1 px-2 border-r border-slate-200 text-right">
+                <FormattedNumberInput
+                  key={`${row.id}-${col.key}`}
+                  value={val}
+                  decimals={2}
+                  onChange={(numVal) => handleCellChange(targetMethodId, row.id, col.key, numVal, rowBiota)}
+                  placeholder="0,00"
+                  className="w-full px-2 py-1 text-right bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800 font-mono"
+                />
+              </td>
+            );
+          }
+
+          if (col.type === 'date') {
+            return (
+              <td key={col.key} className="py-1 px-2 border-r border-slate-200">
+                <input
+                  key={`${row.id}-${col.key}`}
+                  type="date"
+                  value={val || ''}
+                  onChange={(e) => handleCellChange(targetMethodId, row.id, col.key, e.target.value, rowBiota)}
+                  className="w-full px-2 py-1 bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800 font-mono text-xs"
+                />
+              </td>
+            );
+          }
+
+          if (col.type === 'boolean') {
+            return (
+              <td key={col.key} className="py-1 px-2 border-r border-slate-200 text-center">
+                <select
+                  key={`${row.id}-${col.key}`}
+                  value={val === true ? 'true' : val === false ? 'false' : ''}
+                  onChange={(e) => {
+                    const v = e.target.value === 'true' ? true : e.target.value === 'false' ? false : null;
+                    handleCellChange(targetMethodId, row.id, col.key, v, rowBiota);
+                  }}
+                  className="w-full px-2 py-1 bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800 text-xs cursor-pointer font-medium"
+                >
+                  <option value="">-</option>
+                  <option value="true">Ya</option>
+                  <option value="false">Tidak</option>
+                </select>
+              </td>
+            );
+          }
+
+          return (
+            <td key={col.key} className="py-1 px-2 border-r border-slate-200">
+              <input
+                key={`${row.id}-${col.key}`}
+                type="text"
+                value={val || ''}
+                onChange={(e) => handleCellChange(targetMethodId, row.id, col.key, e.target.value, rowBiota)}
+                placeholder={col.label}
+                className="w-full px-2 py-1 bg-transparent hover:bg-white focus:bg-white focus:ring-1 focus:ring-blue-500 rounded border border-transparent hover:border-slate-300 focus:border-blue-500 text-slate-800 font-medium"
+              />
+            </td>
+          );
+        })}
+
+        {/* 3. Action Column */}
+        <td className="py-1.5 px-2 text-center whitespace-nowrap">
+          {serviceId === 'cultural' && (targetMethodId === 'tcm' || targetMethodId === 'cvm') && (
+            <button
+              type="button"
+              onClick={() => setDetailTarget({ method: targetMethodId, rowId: row.id })}
+              disabled={!String(row.item || '').trim()}
+              className="mr-1.5 px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-[11px] font-semibold disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+              title={String(row.item || '').trim() ? 'Input data mentah per responden untuk lokasi ini' : 'Isi nama lokasi dulu'}
+            >
+              Input Responden
+            </button>
+          )}
+          {!isAdmin && (
+            <button
+              type="button"
+              onClick={() => handleDeleteRow(targetMethodId, row.id, rowBiota)}
+              className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors cursor-pointer"
+              title="Hapus baris"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </td>
+      </tr>
+      </React.Fragment>
+    );
+  };
+
+  // Render a Single Method Card vertically
+  const renderMethodCard = (mId: string, mIndex: number) => {
+    const schema = getMethodSchema(serviceId, mId, serviceId === 'provisioning' ? biota : undefined);
+    const selectedMethodConfig = availableMethodsConfig.find(m => m.id === mId);
+    const cleanMethodName = selectedMethodConfig?.name || schema.methodName.replace(/\s*\((Flora|Fauna)\)/i, '');
+    const systemColumns = schema.columns.filter(col => col.key !== 'no');
+
+    const rows = serviceId === 'provisioning' ? [] : getRows(currentProjId, areaId, serviceId, mId, undefined);
+    const customColumns = serviceId === 'provisioning' ? [] : getCustomColumns(currentProjId, areaId, serviceId, mId, undefined);
+
+    const floraRows = serviceId === 'provisioning' ? getRows(currentProjId, areaId, serviceId, mId, 'flora') : [];
+    const faunaRows = serviceId === 'provisioning' ? getRows(currentProjId, areaId, serviceId, mId, 'fauna') : [];
+
+    const floraCustomCols = serviceId === 'provisioning' ? getCustomColumns(currentProjId, areaId, serviceId, mId, 'flora') : [];
+    const faunaCustomCols = serviceId === 'provisioning' ? getCustomColumns(currentProjId, areaId, serviceId, mId, 'fauna') : [];
+
+    const combinedCustomCols: CustomColumnDefinition[] = serviceId === 'provisioning'
+      ? [
+          ...floraCustomCols,
+          ...faunaCustomCols.filter(f => !floraCustomCols.some(fc => fc.key === f.key || fc.label.toLowerCase() === f.label.toLowerCase()))
+        ]
+      : customColumns;
+
+    const allMethodRows = serviceId === 'provisioning' ? [...floraRows, ...faunaRows] : rows;
+    const pendingQuantityRows = allMethodRows.filter(r => {
+      const rowB = r.biota || (faunaRows.includes(r) ? 'fauna' : 'flora');
+      const s = serviceId === 'provisioning' ? getMethodSchema(serviceId, mId, rowB) : getMethodSchema(serviceId, mId);
+      const calc = s.calculateRow(r);
+      return Boolean(calc.isPendingQuantity);
+    });
+    const calculableRows = allMethodRows.filter(r => {
+      const rowB = r.biota || (faunaRows.includes(r) ? 'fauna' : 'flora');
+      const s = serviceId === 'provisioning' ? getMethodSchema(serviceId, mId, rowB) : getMethodSchema(serviceId, mId);
+      const calc = s.calculateRow(r);
+      return !calc.isPendingQuantity;
+    });
+
+    const floraTotal = floraRows.reduce((acc, row) => acc + getRowTotal(row, 'flora', mId), 0);
+    const faunaTotal = faunaRows.reduce((acc, row) => acc + getRowTotal(row, 'fauna', mId), 0);
+    const methodTotal = serviceId === 'provisioning' ? (floraTotal + faunaTotal) : rows.reduce((acc, row) => acc + getRowTotal(row, undefined, mId), 0);
+
+    // Spanning calculations
+    const totalColIndex = systemColumns.findIndex(col => col.key === 'totalNilai');
+    const leadingColSpan = 1 + (totalColIndex >= 0 ? totalColIndex : systemColumns.length);
+    const remainingColSpan = (totalColIndex >= 0 ? systemColumns.length - 1 - totalColIndex : 0) + combinedCustomCols.length + 1;
+    const totalColSpan = 1 + systemColumns.length + combinedCustomCols.length + 1;
+
+    const isImportOpen = Boolean(importDropdownOpen[mId]);
+    const isDownloadOpen = Boolean(downloadDropdownOpen[mId]);
+
+    return (
+      <div key={mId} className="bg-white rounded-xl border border-slate-200/90 shadow-2xs overflow-hidden transition-all">
+        {/* Method Card Header Bar */}
+        <div className="p-4 bg-slate-50/90 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <span className={`px-2.5 py-1 rounded text-xs font-extrabold tracking-wider ${accent.badgeBg} ${accent.badgeText} border border-slate-200/60 shadow-2xs`}>
+              Metode {methodsToRender.length > 1 ? `${mIndex + 1} dari ${methodsToRender.length}: ` : ''}{cleanMethodName}
+            </span>
+            {combinedCustomCols.length > 0 && (
+              <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-50 text-blue-700 border border-blue-200 hidden sm:inline-block">
+                +{combinedCustomCols.length} Kolom Custom
+              </span>
+            )}
+          </div>
+
+          {/* Action Buttons for this specific method */}
+          <div className="flex items-center flex-wrap gap-2">
+            {!isAdmin && (
+              <>
+                {serviceId === 'provisioning' ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => handleAddRow(mId, 'flora')}
+                      className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-semibold flex items-center gap-1 transition-colors shadow-xs cursor-pointer"
+                      title="Tambah baris data Flora (Vegetasi)"
+                    >
+                      <span>+ Tambah Flora</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleAddRow(mId, 'fauna')}
+                      className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold flex items-center gap-1 transition-colors shadow-xs cursor-pointer"
+                      title="Tambah baris data Fauna (Perikanan / Satwa)"
+                    >
+                      <span>+ Tambah Fauna</span>
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleAddRow(mId)}
+                    className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs font-semibold flex items-center gap-1 transition-colors shadow-xs cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Tambah Baris</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveModalMethodId(mId);
+                    setEditingColumn(null);
+                    setIsColumnModalOpen(true);
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                  title="Tambah variabel atau kolom baru ke lembar kerja ini"
+                >
+                  <Columns3 className="w-3.5 h-3.5 text-blue-600" />
+                  <span>+ Tambah Kolom</span>
+                </button>
+              </>
+            )}
+
+            {/* Import Data (Excel, CSV, JSON) */}
+            {serviceId === 'provisioning' ? (
+              <div className="relative inline-block text-left">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setImportDropdownOpen(prev => ({ ...prev, [mId]: !prev[mId] }));
+                    setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                  title="Import data (Excel .xlsx, CSV, JSON) untuk Flora atau Fauna"
+                >
+                  <Upload className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Import Data</span>
+                  <ChevronDown className="w-3 h-3 text-slate-400" />
+                </button>
+                {isImportOpen && (
+                  <div className="absolute right-0 mt-1 w-48 bg-white rounded-md shadow-lg border border-slate-200 py-1 z-30 animate-in fade-in-50 duration-100">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setImportDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                        onOpenImportModal(serviceId, mId, 'Flora');
+                      }}
+                      className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-emerald-50 hover:text-emerald-800 flex items-center gap-2 cursor-pointer"
+                    >
+                      <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                      <div>
+                        <div className="font-semibold">Import Data Flora</div>
+                        <div className="text-[10px] text-slate-400">Excel, CSV, atau JSON</div>
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setImportDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                        onOpenImportModal(serviceId, mId, 'Fauna');
+                      }}
+                      className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-amber-50 hover:text-amber-800 flex items-center gap-2 cursor-pointer border-t border-slate-100"
+                    >
+                      <span className="w-2 h-2 rounded-full bg-amber-600"></span>
+                      <div>
+                        <div className="font-semibold">Import Data Fauna</div>
+                        <div className="text-[10px] text-slate-400">Excel, CSV, atau JSON</div>
+                      </div>
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onOpenImportModal(serviceId, mId, 'General')}
+                className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                title={`Import data (Excel, CSV, JSON) sesuai skema ${schema.methodName}`}
+              >
+                <Upload className="w-3.5 h-3.5 text-blue-600" />
+                <span>Import Data</span>
+              </button>
+            )}
+
+            {/* Deleted rows: restore a row that was removed by mistake */}
+            {deletedHere(mId).length > 0 && (
+              <div className="relative inline-block text-left">
+                <button
+                  type="button"
+                  onClick={() => setDeletedMenuOpen((prev) => ({ ...prev, [mId]: !prev[mId] }))}
+                  className="px-3 py-1.5 bg-white hover:bg-amber-50 text-slate-700 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                  title="Baris yang dihapus bisa dikembalikan"
+                >
+                  <Undo2 className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Terhapus ({deletedHere(mId).length})</span>
+                  <ChevronDown className="w-3 h-3 text-slate-400" />
+                </button>
+                {deletedMenuOpen[mId] && (
+                  <div className="absolute right-0 mt-1 w-80 max-h-72 overflow-y-auto bg-white rounded-md shadow-lg border border-slate-200 py-1 z-30 text-xs">
+                    <div className="px-3 py-1 text-[10px] text-slate-400">Disimpan 14 hari di peramban ini. Ctrl+Z mengembalikan yang terakhir.</div>
+                    {deletedHere(mId).map((e) => (
+                      <div key={e.token} className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-slate-50">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-slate-800">{e.label}</div>
+                          <div className="text-[10px] text-slate-400">
+                            dihapus {new Date(e.deletedAt).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 gap-1">
+                          <button type="button" onClick={() => restoreRow(e.token).then(() => setUndoToast(null))}
+                            className="px-2 py-1 rounded bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold">
+                            Pulihkan
+                          </button>
+                          <button type="button" onClick={() => discardDeletedRow(e.token)} title="Buang dari daftar"
+                            className="px-1.5 py-1 rounded hover:bg-rose-50 text-slate-400 hover:text-rose-600">
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Download Template (Excel, CSV, JSON) */}
+            {serviceId === 'provisioning' ? (
+              <div className="relative inline-block text-left">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDownloadDropdownOpen(prev => ({ ...prev, [mId]: !prev[mId] }));
+                    setImportDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                  title="Download template resmi (Excel, CSV, JSON) untuk Flora atau Fauna"
+                >
+                  <Download className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Download Template</span>
+                  <ChevronDown className="w-3 h-3 text-slate-400" />
+                </button>
+                {isDownloadOpen && (
+                  <div className="absolute right-0 mt-1 w-52 bg-white rounded-md shadow-lg border border-slate-200 py-1.5 z-30 animate-in fade-in-50 duration-100 text-xs">
+                    <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                      Template Flora
+                    </div>
+                    <div className="grid grid-cols-3 gap-1 px-2 pb-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                          downloadContextTemplate(serviceId, mId, 'Flora', 'xlsx');
+                        }}
+                        className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded font-semibold text-[11px] text-center border border-emerald-200 cursor-pointer"
+                      >
+                        .xlsx
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                          downloadContextTemplate(serviceId, mId, 'Flora', 'csv');
+                        }}
+                        className="px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-800 rounded font-semibold text-[11px] text-center border border-amber-200 cursor-pointer"
+                      >
+                        .csv
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                          downloadContextTemplate(serviceId, mId, 'Flora', 'json');
+                        }}
+                        className="px-2 py-1 bg-purple-50 hover:bg-purple-100 text-purple-800 rounded font-semibold text-[11px] text-center border border-purple-200 cursor-pointer"
+                      >
+                        .json
+                      </button>
+                    </div>
+
+                    <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-t border-slate-100 mt-1">
+                      Template Fauna
+                    </div>
+                    <div className="grid grid-cols-3 gap-1 px-2 pb-0.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                          downloadContextTemplate(serviceId, mId, 'Fauna', 'xlsx');
+                        }}
+                        className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded font-semibold text-[11px] text-center border border-emerald-200 cursor-pointer"
+                      >
+                        .xlsx
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                          downloadContextTemplate(serviceId, mId, 'Fauna', 'csv');
+                        }}
+                        className="px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-800 rounded font-semibold text-[11px] text-center border border-amber-200 cursor-pointer"
+                      >
+                        .csv
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                          downloadContextTemplate(serviceId, mId, 'Fauna', 'json');
+                        }}
+                        className="px-2 py-1 bg-purple-50 hover:bg-purple-100 text-purple-800 rounded font-semibold text-[11px] text-center border border-purple-200 cursor-pointer"
+                      >
+                        .json
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="relative inline-block text-left">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDownloadDropdownOpen(prev => ({ ...prev, [mId]: !prev[mId] }));
+                    setImportDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 rounded text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                  title={`Download template resmi (${schema.templateFileName})`}
+                >
+                  <Download className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Download Template</span>
+                  <ChevronDown className="w-3 h-3 text-slate-400" />
+                </button>
+                {isDownloadOpen && (
+                  <div className="absolute right-0 mt-1 w-48 bg-white rounded-md shadow-lg border border-slate-200 py-1 z-30 animate-in fade-in-50 duration-100">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                        handleDownloadTemplate(mId, 'xlsx');
+                      }}
+                      className="w-full text-left px-3 py-1.5 text-xs text-slate-700 hover:bg-emerald-50 hover:text-emerald-800 flex items-center gap-2 cursor-pointer"
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+                      Excel Spreadsheet (.xlsx)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                        handleDownloadTemplate(mId, 'csv');
+                      }}
+                      className="w-full text-left px-3 py-1.5 text-xs text-slate-700 hover:bg-amber-50 hover:text-amber-800 flex items-center gap-2 cursor-pointer"
+                    >
+                      <FileText className="w-3.5 h-3.5 text-amber-600" />
+                      CSV / Delimited (.csv)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDownloadDropdownOpen(prev => ({ ...prev, [mId]: false }));
+                        handleDownloadTemplate(mId, 'json');
+                      }}
+                      className="w-full text-left px-3 py-1.5 text-xs text-slate-700 hover:bg-purple-50 hover:text-purple-800 flex items-center gap-2 cursor-pointer"
+                    >
+                      <FileCode className="w-3.5 h-3.5 text-purple-600" />
+                      JSON Dataset (.json)
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Method Subtitle & Formula Description */}
+        <div className="px-4 py-2 bg-slate-50/50 border-b border-slate-200/70 text-[11px] text-slate-500 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div>
+            <span>Formula: </span>
+            {serviceId === 'provisioning' && mId === 'market-price' ? (
+              <span className="text-slate-700 font-medium">
+                <span className="text-emerald-700 font-semibold">[Flora]</span> Vol (m³) × Harga (Rp/m³)&nbsp;&nbsp;|&nbsp;&nbsp;
+                <span className="text-amber-700 font-semibold">[Fauna/Perikanan Pesisir]</span> Kuantitas (kg / ekor) × Harga (Rp/kg / Rp/ekor) <span className="text-slate-400 font-normal">atau</span> Prod × Luas (Ha) × Harga
+              </span>
+            ) : (
+              <strong className="text-slate-700 font-medium">{schema.formulaDescription}</strong>
+            )}
+          </div>
+          <div className="text-[11px] text-slate-500 shrink-0">
+            Keterangan: <span className="font-semibold text-slate-700">{schema.subtitle}</span>
+          </div>
+        </div>
+
+        {/* Table Container */}
+        <div className="p-4">
+          <div className="overflow-x-auto border border-slate-200 rounded-md">
+            <table className="w-full text-left border-collapse text-xs select-text">
+              <thead>
+                <tr className="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200 text-[11px] select-none">
+                  <th className="py-2.5 px-3 w-12 text-center border-r border-slate-200">No</th>
+
+                  {systemColumns.map((col: ColumnDefinition) => {
+                    if (col.key === 'totalNilai' || col.type === 'readonly_calculated') {
+                      return (
+                        <th
+                          key={col.key}
+                          className="py-2.5 px-3 min-w-[180px] text-right border-r border-slate-200 bg-slate-200/50 text-slate-900 font-bold select-none"
+                        >
+                          <span className="flex items-center justify-end gap-1">
+                            <Lock className="w-3 h-3 text-slate-500" />
+                            Total Nilai Ekonomi (Rp)
+                          </span>
+                        </th>
+                      );
+                    }
+
+                    if (serviceId === 'provisioning' && col.key === 'produktivitas') {
+                      return (
+                        <th
+                          key={col.key}
+                          className={`py-2 px-3 border-r border-slate-200 ${col.width || ''} text-right`}
+                        >
+                          <div className="flex flex-col items-end leading-tight">
+                            <span>Produktivitas</span>
+                            <span className="text-[10px] text-slate-500 font-normal leading-tight">
+                              m³/ha (Flora) · kg/ha/th / ekor/ha/th (Fauna)
+                            </span>
+                          </div>
+                        </th>
+                      );
+                    }
+
+                    if (serviceId === 'provisioning' && col.key === 'hargaUnit') {
+                      return (
+                        <th
+                          key={col.key}
+                          className={`py-2 px-3 border-r border-slate-200 ${col.width || ''} text-right`}
+                        >
+                          <div className="flex flex-col items-end leading-tight">
+                            <span>Harga Pasar / Unit</span>
+                            <span className="text-[10px] text-slate-500 font-normal leading-tight">
+                              Rp/m³ (Flora) · Rp/kg / Rp/ekor (Fauna)
+                            </span>
+                          </div>
+                        </th>
+                      );
+                    }
+
+                    if (serviceId === 'provisioning' && col.key === 'jumlah') {
+                      return (
+                        <th
+                          key={col.key}
+                          className={`py-2 px-3 border-r border-slate-200 ${col.width || ''} text-right`}
+                        >
+                          <div className="flex flex-col items-end leading-tight">
+                            <span>Volume / Kuantitas</span>
+                            <span className="text-[10px] text-slate-500 font-normal leading-tight">
+                              m³ (Flora) · kg / ekor (Fauna)
+                            </span>
+                          </div>
+                        </th>
+                      );
+                    }
+
+                    return (
+                      <th
+                        key={col.key}
+                        className={`py-2.5 px-3 border-r border-slate-200 ${col.width || ''} text-${col.align || 'left'}`}
+                      >
+                        <div className="flex items-center justify-between gap-1">
+                          <span>
+                            {serviceId === 'provisioning' && col.key === 'item'
+                              ? 'Jenis Biota (Flora / Fauna)'
+                              : `${col.label} ${col.unit ? `(${col.unit})` : ''}`}
+                          </span>
+                          {serviceId === 'cultural' && DERIVED_COLUMN_HELP[`${mId}:${col.key}`] && (
+                            <span
+                              className="shrink-0 cursor-help text-slate-400 hover:text-indigo-600"
+                              title={DERIVED_COLUMN_HELP[`${mId}:${col.key}`]}
+                              aria-label={DERIVED_COLUMN_HELP[`${mId}:${col.key}`]}
+                            >
+                              <HelpCircle className="w-3.5 h-3.5" />
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                    );
+                  })}
+
+                  {combinedCustomCols.map((col: CustomColumnDefinition) => (
+                    <th
+                      key={col.key}
+                      className="py-2 px-3 border-r border-slate-200 min-w-[170px] bg-slate-100/90 text-left select-none group"
+                    >
+                      <div className="flex items-center justify-between gap-1.5">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="truncate font-semibold text-slate-800" title={col.label}>
+                            {col.label}
+                          </span>
+                          {col.required && (
+                            <span className="text-rose-500 font-bold" title="Wajib diisi">*</span>
+                          )}
+                          <span className="text-[9px] font-bold uppercase tracking-wider text-blue-700 bg-blue-50 border border-blue-200/80 px-1.5 py-0.5 rounded shrink-0">
+                            Custom
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveModalMethodId(mId);
+                              setEditingColumn(col);
+                              setIsColumnModalOpen(true);
+                            }}
+                            className="p-1 rounded text-slate-400 hover:text-blue-600 hover:bg-slate-200/70 transition-colors cursor-pointer"
+                            title="Edit nama atau tipe data kolom"
+                          >
+                            <Pencil className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveModalMethodId(mId);
+                              setDeletingColumn(col);
+                            }}
+                            className="p-1 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                            title="Hapus kolom ini"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </th>
+                  ))}
+
+                  <th className={`py-2.5 px-3 text-center ${serviceId === 'cultural' && (mId === 'tcm' || mId === 'cvm') ? 'w-44' : 'w-14'}`}>Aksi</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200">
+                {serviceId === 'provisioning' ? (
+                  <>
+                    {/* FLORA SECTION */}
+                    <tr className="bg-emerald-50/80 border-b border-emerald-200 select-none">
+                      <td colSpan={totalColSpan} className="py-2.5 px-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2.5">
+                            <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 ring-2 ring-emerald-200"></span>
+                            <span className="font-bold text-xs uppercase tracking-wider text-emerald-950">
+                              A.1 Flora ({cleanMethodName})
+                            </span>
+                            <span className="text-[11px] font-semibold text-emerald-800 bg-emerald-100/80 border border-emerald-200 px-2 py-0.5 rounded-full shadow-2xs">
+                              {floraRows.length} item
+                            </span>
+                            <span className="text-[10px] text-emerald-700 bg-emerald-100/60 border border-emerald-200/80 px-2 py-0.5 rounded hidden sm:inline-block">
+                              Satuan Vegetasi: m³/ha • Volume (m³) • Harga (Rp/m³)
+                            </span>
+                          </div>
+                          {!isAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => handleAddRow(mId, 'flora')}
+                              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[11px] font-semibold flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                            >
+                              <span>+ Tambah Flora</span>
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+
+                    {floraRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={totalColSpan} className="py-6 text-center text-slate-400 italic bg-white">
+                          Belum ada data Flora untuk {cleanMethodName}.{' '}
+                          {!isAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => handleAddRow(mId, 'flora')}
+                              className="text-emerald-700 font-semibold underline hover:text-emerald-800 ml-1 cursor-pointer"
+                            >
+                              Tambah baris Flora
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ) : (
+                      floraRows.map((row, idx) => renderRow(row, idx, mId, systemColumns, combinedCustomCols, 'flora'))
+                    )}
+
+                    {/* FAUNA SECTION */}
+                    <tr className="bg-amber-50/80 border-b border-amber-200 select-none">
+                      <td colSpan={totalColSpan} className="py-2.5 px-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2.5">
+                            <span className="w-2.5 h-2.5 rounded-full bg-amber-600 ring-2 ring-amber-200"></span>
+                            <span className="font-bold text-xs uppercase tracking-wider text-amber-950">
+                              A.2 Fauna ({cleanMethodName})
+                            </span>
+                            <span className="text-[11px] font-semibold text-amber-800 bg-amber-100/80 border border-amber-200 px-2 py-0.5 rounded-full shadow-2xs">
+                              {faunaRows.length} item
+                            </span>
+                            <span className="text-[10px] text-amber-800 bg-amber-100/80 border border-amber-300 px-2 py-0.5 rounded font-medium hidden sm:inline-block">
+                              Satuan Komoditas Pesisir: kg & Rp/kg (perikanan/berat) • ekor & Rp/ekor (satwa/individu)
+                            </span>
+                          </div>
+                          {!isAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => handleAddRow(mId, 'fauna')}
+                              className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-semibold flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                            >
+                              <span>+ Tambah Fauna</span>
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+
+                    {faunaRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={totalColSpan} className="py-6 text-center text-slate-400 italic bg-white">
+                          Belum ada data Fauna untuk {cleanMethodName}.{' '}
+                          {!isAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => handleAddRow(mId, 'fauna')}
+                              className="text-amber-700 font-semibold underline hover:text-amber-800 ml-1 cursor-pointer"
+                            >
+                              Tambah baris Fauna
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ) : (
+                      faunaRows.map((row, idx) => renderRow(row, idx, mId, systemColumns, combinedCustomCols, 'fauna'))
+                    )}
+                  </>
+                ) : (
+                  rows.length === 0 ? (
+                    <tr>
+                      <td
+                        colSpan={totalColSpan}
+                        className="py-8 text-center text-slate-400 italic"
+                      >
+                        Belum ada baris data untuk <strong>{cleanMethodName}</strong>. Klik <strong>"Tambah Baris"</strong> untuk memulai pengisian data.
+                      </td>
+                    </tr>
+                  ) : (
+                    rows.map((row, rIdx) => renderRow(row, rIdx, mId, systemColumns, combinedCustomCols))
+                  )
+                )}
+              </tbody>
+
+              {/* Table Footer: Method Subtotal */}
+              <tfoot>
+                <tr className="bg-slate-100 border-t-2 border-slate-300 font-bold text-slate-900 select-none">
+                  <td
+                    colSpan={leadingColSpan}
+                    className="py-3 px-4 text-right uppercase text-xs tracking-wider text-slate-800 font-bold"
+                  >
+                    TOTAL NILAI EKONOMI ({cleanMethodName.toUpperCase()}) :
+                  </td>
+                  <td className="py-3 px-3 text-right font-mono text-sm font-bold text-blue-800 bg-blue-50 border-x border-blue-200">
+                    <div>{formatIDR(methodTotal)}</div>
+                    {pendingQuantityRows.length > 0 && (
+                      <div className="text-[10px] text-amber-700 font-sans font-medium mt-0.5 flex items-center justify-end gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                        <span>*Total sementara ({pendingQuantityRows.length} komoditas belum dapat dihitung)</span>
+                      </div>
+                    )}
+                  </td>
+                  <td
+                    colSpan={remainingColSpan}
+                    className="py-3 px-3 text-xs text-slate-500 font-normal"
+                  >
+                    {serviceId === 'provisioning' ? (
+                      <div className="flex flex-col gap-0.5">
+                        <span>
+                          {calculableRows.length} dari {allMethodRows.length} komoditas terhitung ({floraRows.length} Flora, {faunaRows.length} Fauna)
+                        </span>
+                        {pendingQuantityRows.length > 0 && (
+                          <span className="text-amber-700 font-medium text-[11px]">
+                            ⚠ {pendingQuantityRows.length} komoditas berstatus "Belum dapat dihitung" (menunggu volume/produktivitas)
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      `${rows.length} item terhitung`
+                    )}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className={`bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden transition-all border-l-4 ${accent.borderLeft}`}>
+      {/* Category Accordion Header */}
+      <div
+        onClick={onToggleOpen}
+        className="p-4 bg-slate-50/90 hover:bg-slate-100/80 cursor-pointer flex items-center justify-between gap-3 select-none transition-colors border-b border-slate-200"
+      >
+        <div className="flex items-center gap-3">
+          <span className={`w-8 h-8 rounded-lg flex items-center justify-center font-extrabold text-sm ${accent.badgeBg} ${accent.badgeText} shadow-xs flex-shrink-0`}>
+            {prefixLetter}
+          </span>
+
+          <div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="font-bold text-slate-900 text-sm md:text-base">
+                {prefixLetter}. {serviceName}
+              </h3>
+
+              {/* Badges showing active methods */}
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {methodsToRender.map((mId) => {
+                  const mSchema = getMethodSchema(serviceId, mId);
+                  const mName = mSchema?.methodName?.split('(')[0]?.trim() || mId;
+                  return (
+                    <span
+                      key={mId}
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold ${accent.pillBg} ${accent.pillText} border border-slate-200/80 shadow-2xs`}
+                    >
+                      {mName}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="text-[11px] text-slate-500 mt-0.5">
+              Area: <strong className="text-slate-700">{areaName}</strong> • {methodsToRender.length} Metode Valuasi Aktif (Layout Vertikal Card)
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 md:gap-4 shrink-0">
+          <div className="text-right hidden sm:block">
+            <span className="text-xs font-semibold text-slate-700 bg-slate-100 border border-slate-200 px-3 py-1 rounded-md">
+              {categoryItemCount} item ({methodsToRender.length} Metode)
+            </span>
+          </div>
+
+          <button
+            type="button"
+            className="p-1 rounded text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
+          >
+            {isOpen ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
+          </button>
+        </div>
+      </div>
+
+      {/* Category Accordion Body */}
+      {isOpen && (
+        <div className="p-4 space-y-6 bg-slate-50/40 animate-in slide-in-from-top-1 duration-150">
+          {/* Vertical Stack of Method Cards */}
+          {methodsToRender.map((mId, mIndex) => renderMethodCard(mId, mIndex))}
+        </div>
+      )}
+
+      {/* Modal Custom Column */}
+      <CustomColumnModal
+        isOpen={isColumnModalOpen}
+        onClose={() => {
+          setIsColumnModalOpen(false);
+          setEditingColumn(null);
+        }}
+        onSave={handleSaveCustomColumn}
+        editingColumn={editingColumn}
+        existingColumnLabels={[
+          'No',
+          ...getMethodSchema(serviceId, activeModalMethodId || methodsToRender[0], serviceId === 'provisioning' ? biota : undefined).columns.map(c => c.label)
+        ]}
+      />
+
+      {/* Modal Confirm Delete Column */}
+      <DeleteColumnConfirmModal
+        isOpen={!!deletingColumn}
+        onClose={() => setDeletingColumn(null)}
+        onConfirm={handleConfirmDeleteColumn}
+        column={deletingColumn}
+      />
+
+      {undoToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-3 rounded-lg bg-slate-900 text-white text-xs px-4 py-2.5 shadow-xl">
+          <span className="max-w-[320px] truncate">“{undoToast.label}” dihapus.</span>
+          <button
+            type="button"
+            onClick={() => restoreRow(undoToast.token).then(() => setUndoToast(null))}
+            className="font-bold text-amber-300 hover:text-amber-200 flex items-center gap-1"
+          >
+            <Undo2 className="w-3.5 h-3.5" /> Urungkan
+          </button>
+          <button type="button" onClick={() => setUndoToast(null)} className="text-slate-400 hover:text-white" aria-label="Tutup">✕</button>
+        </div>
+      )}
+
+      {/* Modal input data mentah per responden (TCM & CVM) */}
+      {detailTarget && (() => {
+        const row = getRows(currentProjId, areaId, serviceId, detailTarget.method, undefined).find((r) => r.id === detailTarget.rowId);
+        if (!row) return null;
+        return (
+          <RespondentDetailModal
+            isOpen
+            onClose={() => setDetailTarget(null)}
+            projectId={currentProjId}
+            method={detailTarget.method}
+            lokasi={String(row.item || '').trim()}
+            defaultTotal={Number(detailTarget.method === 'tcm' ? row.kunjungan : row.populasi) || undefined}
+            initialDetail={row.detail?.items?.length ? row.detail : undefined}
+            tableValue={Number(detailTarget.method === 'tcm' ? row.biayaPerjalanan : row.wtp) || undefined}
+            tableSource={String(row.source || '') || undefined}
+            onApply={(patch) => updateCell(currentProjId, areaId, serviceId, detailTarget.method, 'none', row.id, patch)}
+          />
+        );
+      })()}
+
+      {/* Modal Konfirmasi Peringatan Data Master Biota */}
+      {isAddMasterModalOpen && currentProjId && (
+        <MasterBiotaWarningModal
+          isOpen={isAddMasterModalOpen}
+          onClose={() => setIsAddMasterModalOpen(false)}
+          projectId={currentProjId}
+          category={addMasterCandidate.category}
+          biotaType={addMasterCandidate.biotaType}
+          biotaName={addMasterCandidate.name}
+          landCoverId={areaId}
+          onSuccess={handleMasterAdded}
+        />
+      )}
+
+    </div>
+  );
+};
+
+export default DynamicServiceSection;

@@ -1,0 +1,50 @@
+# Dependencies
+**/node_modules/
+**/vendor/
+
+# Build artifacts
+**/dist/
+**/dist-ssr/
+**/public/build/
+**/public/hot/
+**/public/storage/
+
+# Environment files (contain secrets)
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.docker.example
+!**/.env.docker.example
+
+# Laravel storage and runtime cache
+**/storage/logs/*
+**/storage/framework/cache/*
+**/storage/framework/sessions/*
+**/storage/framework/views/*
+**/storage/*.key
+**/storage/pail/
+**/bootstrap/cache/*
+**/.phpunit.result.cache
+**/.phpunit.cache
+
+# Docker volumes and databases
+**/mysql-data/
+**/postgres-data/
+**/*.sqlite
+**/*.sqlite-journal
+
+# Logs and system dumps
+*.log
+*.stackdump
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+**/.vscode/
+**/.idea/
+**/.cursor/
+**/.zed/

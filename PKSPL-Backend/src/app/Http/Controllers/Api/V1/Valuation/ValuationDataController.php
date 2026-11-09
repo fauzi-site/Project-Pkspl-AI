@@ -1,0 +1,636 @@
+<?php
+
+namespace App\Http\Controllers\Api\V1\Valuation;
+
+use App\Http\Controllers\Controller;
+use App\Models\AreaServiceConfig;
+use App\Models\JenisTutupanLahan;
+use App\Models\ValuationCustomColumn;
+use App\Models\ValuationRow;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\Response;
+
+/**
+ * Menangani endpoint Data Valuasi (workflow peneliti).
+ *
+ * Hirarki data:
+ *   JenisTutupanLahan → AreaServiceConfig → ValuationRow → ValuationCustomColumn
+ */
+class ValuationDataController extends Controller
+{
+    // =========================================================================
+    // HELPER PRIVATE
+    // =========================================================================
+
+    /** Mengambil land cover atau menghentikan request dengan 404. */
+    private function findLandCover(int $landCoverId): JenisTutupanLahan
+    {
+        return JenisTutupanLahan::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId)
+            ->firstOrFail();
+    }
+
+    // =========================================================================
+    // AREA SERVICE CONFIGS
+    // =========================================================================
+
+    /**
+     * GET /v1/jenis-tutupan-lahan/{landCoverId}/valuation/configs
+     *
+     * Menampilkan seluruh konfigurasi service untuk area tutupan lahan tertentu.
+     */
+    public function getConfigs(int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $configs = AreaServiceConfig::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId)
+            ->get();
+
+        return response()->json([
+            'data'    => $configs,
+            'message' => 'Konfigurasi service berhasil diambil.',
+        ]);
+    }
+
+    /**
+     * PUT /v1/jenis-tutupan-lahan/{landCoverId}/valuation/configs
+     *
+     * Bulk upsert semua konfigurasi service sekaligus.
+     * Body: { configs: [ {service_id, is_active, method_id, biota?}, ... ] }
+     */
+    public function upsertConfigs(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $validated = $request->validate([
+            'configs'                => ['required', 'array'],
+            'configs.*.service_id'   => ['required', 'string', 'max:50'],
+            'configs.*.is_active'    => ['required', 'boolean'],
+            'configs.*.method_id'    => ['required', 'string', 'max:100'],
+            'configs.*.biota'        => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+        ]);
+
+        $upserted = [];
+        $keepIds = [];
+        foreach ($validated['configs'] as $cfg) {
+            $record = AreaServiceConfig::query()->updateOrCreate(
+                [
+                    'id_jenis_tutupan_lahan' => $landCoverId,
+                    'service_id'             => $cfg['service_id'],
+                    'method_id'              => $cfg['method_id'],
+                ],
+                [
+                    'is_active' => $cfg['is_active'],
+                    'biota'     => $cfg['biota'] ?? null,
+                ]
+            );
+            $upserted[] = $record;
+            $keepIds[] = $record->id;
+        }
+
+        if (!empty($keepIds)) {
+            AreaServiceConfig::query()
+                ->where('id_jenis_tutupan_lahan', $landCoverId)
+                ->whereNotIn('id', $keepIds)
+                ->delete();
+        } else {
+            AreaServiceConfig::query()
+                ->where('id_jenis_tutupan_lahan', $landCoverId)
+                ->delete();
+        }
+
+        return response()->json([
+            'data'    => $upserted,
+            'message' => 'Konfigurasi service berhasil diperbarui.',
+        ]);
+    }
+
+    // =========================================================================
+    // VALUATION ROWS
+    // =========================================================================
+
+    /**
+     * GET /v1/jenis-tutupan-lahan/{landCoverId}/valuation/rows
+     *
+     * Menampilkan baris data valuasi beserta kolom custom yang terkait.
+     * Query params: service_id, method_id, biota (opsional sebagai filter).
+     */
+    public function getRows(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $filter = $request->validate([
+            'service_id' => ['nullable', 'string', 'max:50'],
+            'method_id'  => ['nullable', 'string', 'max:100'],
+            'biota'      => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+        ]);
+
+        $rowsQuery = ValuationRow::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId)
+            ->orderBy('row_order');
+
+        $colsQuery = ValuationCustomColumn::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId)
+            ->orderBy('col_order');
+
+        foreach (['service_id', 'method_id', 'biota'] as $field) {
+            if (!empty($filter[$field])) {
+                $rowsQuery->where($field, $filter[$field]);
+                $colsQuery->where($field, $filter[$field]);
+            }
+        }
+
+        return response()->json([
+            'data' => [
+                'rows'           => $rowsQuery->get(),
+                'custom_columns' => $colsQuery->get(),
+            ],
+            'message' => 'Data baris valuasi berhasil diambil.',
+        ]);
+    }
+
+    /**
+     * POST /v1/jenis-tutupan-lahan/{landCoverId}/valuation/rows
+     *
+     * Menambahkan satu baris data valuasi baru. Tidak mengubah Data Master.
+     * Body: { service_id, method_id, biota?, row_order?, row_data, total_nilai? }
+     */
+    public function addRow(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $validated = $request->validate([
+            'service_id'  => ['required', 'string', 'max:50'],
+            'method_id'   => ['required', 'string', 'max:100'],
+            'biota'       => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+            'row_order'   => ['nullable', 'integer', 'min:0'],
+            'row_data'    => ['required', 'array'],
+            'total_nilai' => ['nullable', 'numeric'],
+        ]);
+
+        $clientRowId = $validated['row_data']['id'] ?? null;
+        $row = null;
+
+        if ($clientRowId) {
+            $row = ValuationRow::query()
+                ->where('id_jenis_tutupan_lahan', $landCoverId)
+                ->where('service_id', $validated['service_id'])
+                ->where('method_id', $validated['method_id'])
+                ->when($validated['biota'] ?? null, fn($q, $b) => $q->where('biota', $b))
+                ->whereRaw("row_data->>'id' = ?", [$clientRowId])
+                ->first();
+        }
+
+        if ($row) {
+            $row->update($validated);
+        } else {
+            $row = ValuationRow::query()->create(array_merge(
+                $validated,
+                ['id_jenis_tutupan_lahan' => $landCoverId]
+            ));
+        }
+
+        return response()->json([
+            'data'    => $row,
+            'message' => 'Baris data valuasi berhasil ditambahkan.',
+        ], Response::HTTP_CREATED);
+    }
+
+    /**
+     * POST /v1/jenis-tutupan-lahan/{landCoverId}/valuation/rows/batch
+     *
+     * Menambahkan banyak baris data valuasi sekaligus (misal hasil Excel import).
+     * Tidak mengubah Data Master.
+     */
+    public function batchImportRows(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $validated = $request->validate([
+            'service_id' => ['required', 'string', 'max:50'],
+            'method_id'  => ['required', 'string', 'max:100'],
+            'biota'      => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+            'rows'       => ['required', 'array'],
+            'rows.*.row_data'    => ['required', 'array'],
+            'rows.*.total_nilai' => ['nullable', 'numeric'],
+            'rows.*.row_order'   => ['nullable', 'integer'],
+        ]);
+
+        $createdRows = [];
+
+        foreach ($validated['rows'] as $r) {
+            $rowData = $r['row_data'] ?? [];
+            $clientRowId = $r['client_id'] ?? ($rowData['id'] ?? null);
+            $totalNilai = (float) ($r['total_nilai'] ?? ($rowData['totalNilai'] ?? 0));
+            $rowOrder = (int) ($r['row_order'] ?? ($rowData['no'] ?? count($createdRows)));
+
+            $row = ValuationRow::query()->create([
+                'id_jenis_tutupan_lahan' => $landCoverId,
+                'service_id'             => $validated['service_id'],
+                'method_id'              => $validated['method_id'],
+                'biota'                  => $validated['biota'] ?? null,
+                'row_order'              => $rowOrder,
+                'row_data'               => $rowData,
+                'total_nilai'            => $totalNilai,
+            ]);
+
+            $createdRows[] = $row;
+        }
+
+        return response()->json([
+            'data'    => $createdRows,
+            'count'   => count($createdRows),
+            'message' => 'Seluruh baris data valuasi berhasil diimpor.',
+        ], Response::HTTP_CREATED);
+    }
+
+    /**
+     * POST /v1/jenis-tutupan-lahan/{landCoverId}/valuation/sync-all
+     *
+     * Menyimpan seluruh section/metode data valuasi pada area tutupan lahan sekaligus
+     * ke dalam valuation_rows. Tidak mengubah Data Master.
+     */
+    public function syncAllSections(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $validated = $request->validate([
+            'sections' => ['required', 'array'],
+            'sections.*.service_id' => ['required', 'string', 'max:50'],
+            'sections.*.method_id'  => ['required', 'string', 'max:100'],
+            'sections.*.biota'      => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+            'sections.*.rows'       => ['required', 'array'],
+        ]);
+
+        $totalSynced = 0;
+        $idMappings = [];
+
+        foreach ($validated['sections'] as $sec) {
+            $serviceId = $sec['service_id'];
+            $methodId = $sec['method_id'];
+            $biota = $sec['biota'] ?? null;
+            $keptRowIds = [];
+
+            foreach ($sec['rows'] as $index => $rowData) {
+                if (!is_array($rowData)) continue;
+
+                $clientRowId = $rowData['id'] ?? null;
+                $rawItem = trim((string) ($rowData['item'] ?? ($rowData['nama_objek'] ?? '')));
+                $totalNilai = (float) ($rowData['totalNilai'] ?? ($rowData['total_nilai'] ?? 0));
+                $rowOrder = (int) ($rowData['no'] ?? ($index + 1)) - 1;
+
+                $row = null;
+                if (!empty($rowData['backendId'])) {
+                    $row = ValuationRow::where('id_jenis_tutupan_lahan', $landCoverId)
+                        ->where('id', (int) $rowData['backendId'])
+                        ->first();
+                }
+
+                if (!$row && $clientRowId) {
+                    $row = ValuationRow::where('id_jenis_tutupan_lahan', $landCoverId)
+                        ->where('service_id', $serviceId)
+                        ->where('method_id', $methodId)
+                        ->when($biota, fn($q) => $q->where('biota', $biota))
+                        ->whereRaw("row_data->>'id' = ?", [$clientRowId])
+                        ->first();
+                }
+
+                if (!$row && $rawItem !== '') {
+                    $row = ValuationRow::where('id_jenis_tutupan_lahan', $landCoverId)
+                        ->where('service_id', $serviceId)
+                        ->where('method_id', $methodId)
+                        ->when($biota, fn($q) => $q->where('biota', $biota))
+                        ->whereRaw("LOWER(TRIM(COALESCE(row_data->>'item', ''))) = ?", [strtolower($rawItem)])
+                        ->first();
+                }
+
+                if ($row) {
+                    $row->update([
+                        'row_order'   => $rowOrder,
+                        'row_data'    => $rowData,
+                        'total_nilai' => $totalNilai,
+                    ]);
+                } else {
+                    $row = ValuationRow::create([
+                        'id_jenis_tutupan_lahan' => $landCoverId,
+                        'service_id'             => $serviceId,
+                        'method_id'              => $methodId,
+                        'biota'                  => $biota,
+                        'row_order'              => $rowOrder,
+                        'row_data'               => $rowData,
+                        'total_nilai'            => $totalNilai,
+                    ]);
+                }
+
+                $keptRowIds[] = $row->id;
+
+                if ($clientRowId) {
+                    $idMappings[$clientRowId] = $row->id;
+                }
+                $totalSynced++;
+            }
+
+            // Hapus baris di database untuk section ini yang sudah dihapus oleh pengguna di frontend
+            // Catatan: Baris valuasi dihapus, namun data master dipertahankan
+            if (!empty($keptRowIds)) {
+                $orphans = ValuationRow::where('id_jenis_tutupan_lahan', $landCoverId)
+                    ->where('service_id', $serviceId)
+                    ->where('method_id', $methodId)
+                    ->when($biota, fn($q) => $q->where('biota', $biota))
+                    ->whereNotIn('id', $keptRowIds)
+                    ->get();
+
+                foreach ($orphans as $orphan) {
+                    $orphan->delete();
+                }
+            }
+        }
+
+        return response()->json([
+            'message'    => "Berhasil menyimpan {$totalSynced} baris data valuasi.",
+            'mappings'   => $idMappings,
+            'count'      => $totalSynced,
+        ]);
+    }
+
+    /**
+     * PUT /v1/jenis-tutupan-lahan/{landCoverId}/valuation/rows/{rowId}
+     *
+     * Memperbarui row_data dan total_nilai pada baris valuasi. Tidak mengubah Data Master.
+     */
+    public function updateRow(Request $request, int $landCoverId, string|int $rowId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $query = ValuationRow::query()->where('id_jenis_tutupan_lahan', $landCoverId);
+
+        $strId = (string) $rowId;
+        if (is_numeric($strId)) {
+            $query->where(function ($q) use ($strId) {
+                $q->where('id', (int) $strId)
+                  ->orWhereRaw("row_data->>'id' = ?", [$strId]);
+            });
+        } else {
+            $query->whereRaw("row_data->>'id' = ?", [$strId]);
+        }
+
+        $row = $query->first();
+
+        $validated = $request->validate([
+            'service_id'  => ['nullable', 'string', 'max:50'],
+            'method_id'   => ['nullable', 'string', 'max:100'],
+            'biota'       => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+            'row_order'   => ['nullable', 'integer', 'min:0'],
+            'row_data'    => ['nullable', 'array'],
+            'total_nilai' => ['nullable', 'numeric'],
+        ]);
+
+        if (!$row) {
+            $rowData = $validated['row_data'] ?? [];
+            $row = ValuationRow::query()->create([
+                'id_jenis_tutupan_lahan' => $landCoverId,
+                'service_id'             => $validated['service_id'] ?? ($request->input('service_id') ?? 'provisioning'),
+                'method_id'              => $validated['method_id'] ?? ($request->input('method_id') ?? 'market-price'),
+                'biota'                  => $validated['biota'] ?? $request->input('biota'),
+                'row_order'              => (int) ($validated['row_order'] ?? 0),
+                'row_data'               => $rowData,
+                'total_nilai'            => (float) ($validated['total_nilai'] ?? 0),
+            ]);
+        } else {
+            $row->update($validated);
+        }
+
+        return response()->json([
+            'data'    => $row->refresh(),
+            'message' => 'Baris data valuasi berhasil diperbarui.',
+        ]);
+    }
+
+    /**
+     * DELETE /v1/jenis-tutupan-lahan/{landCoverId}/valuation/rows/{rowId}
+     *
+     * Menghapus baris data valuasi berdasarkan database ID maupun client row ID.
+     * Data Master tidak ikut terhapus.
+     * Mengembalikan 204 No Content secara idempoten bahkan jika baris sudah terhapus.
+     */
+    public function deleteRow(int $landCoverId, string|int $rowId): Response
+    {
+        $this->findLandCover($landCoverId);
+
+        $query = ValuationRow::query()->where('id_jenis_tutupan_lahan', $landCoverId);
+
+        $strId = (string) $rowId;
+        if (is_numeric($strId)) {
+            $query->where(function ($q) use ($strId) {
+                $q->where('id', (int) $strId)
+                  ->orWhereRaw("row_data->>'id' = ?", [$strId]);
+            });
+        } else {
+            $query->whereRaw("row_data->>'id' = ?", [$strId]);
+        }
+
+        $rows = $query->get();
+
+        foreach ($rows as $row) {
+            $row->delete();
+        }
+
+        return response()->noContent();
+    }
+
+    /**
+     * POST /v1/jenis-tutupan-lahan/{landCoverId}/valuation/rows/reorder
+     *
+     * Memperbarui urutan baris sesuai array id yang dikirim.
+     * Body: { service_id, method_id, biota?, ordered_ids: [id1, id2, ...] }
+     */
+    public function reorderRows(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $validated = $request->validate([
+            'service_id'    => ['required', 'string', 'max:50'],
+            'method_id'     => ['required', 'string', 'max:100'],
+            'biota'         => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+            'ordered_ids'   => ['required', 'array'],
+            'ordered_ids.*' => ['required', 'integer'],
+        ]);
+
+        foreach ($validated['ordered_ids'] as $order => $id) {
+            ValuationRow::query()
+                ->where('id_jenis_tutupan_lahan', $landCoverId)
+                ->where('id', $id)
+                ->update(['row_order' => $order]);
+        }
+
+        // Kembalikan baris yang telah diurutkan ulang
+        $rows = ValuationRow::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId)
+            ->where('service_id', $validated['service_id'])
+            ->where('method_id', $validated['method_id'])
+            ->when(!empty($validated['biota']), fn ($q) => $q->where('biota', $validated['biota']))
+            ->orderBy('row_order')
+            ->get();
+
+        return response()->json([
+            'data'    => $rows,
+            'message' => 'Urutan baris berhasil diperbarui.',
+        ]);
+    }
+
+    // =========================================================================
+    // VALUATION CUSTOM COLUMNS
+    // =========================================================================
+
+    /**
+     * GET /v1/jenis-tutupan-lahan/{landCoverId}/valuation/custom-columns
+     *
+     * Menampilkan kolom custom untuk kombinasi service + method + biota tertentu.
+     * Query params: service_id, method_id, biota (opsional sebagai filter).
+     */
+    public function getCustomColumns(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $filter = $request->validate([
+            'service_id' => ['nullable', 'string', 'max:50'],
+            'method_id'  => ['nullable', 'string', 'max:100'],
+            'biota'      => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+        ]);
+
+        $query = ValuationCustomColumn::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId)
+            ->orderBy('col_order');
+
+        foreach (['service_id', 'method_id', 'biota'] as $field) {
+            if (!empty($filter[$field])) {
+                $query->where($field, $filter[$field]);
+            }
+        }
+
+        return response()->json([
+            'data'    => $query->get(),
+            'message' => 'Kolom custom berhasil diambil.',
+        ]);
+    }
+
+    /**
+     * POST /v1/jenis-tutupan-lahan/{landCoverId}/valuation/custom-columns
+     *
+     * Menambahkan definisi kolom custom baru untuk metode tertentu.
+     * Body: { service_id, method_id, biota?, column_key, label, type?, is_required?, col_order? }
+     */
+    public function addCustomColumn(Request $request, int $landCoverId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $validated = $request->validate([
+            'service_id'  => ['required', 'string', 'max:50'],
+            'method_id'   => ['required', 'string', 'max:100'],
+            'biota'       => ['nullable', 'string', 'in:flora,fauna', 'max:20'],
+            'column_key'  => ['required', 'string', 'max:150'],
+            'label'       => ['required', 'string', 'max:200'],
+            'type'        => ['nullable', 'string', 'in:text,integer,decimal,date,boolean'],
+            'is_required' => ['nullable', 'boolean'],
+            'col_order'   => ['nullable', 'integer', 'min:0'],
+        ]);
+
+        $column = ValuationCustomColumn::query()->updateOrCreate(
+            [
+                'id_jenis_tutupan_lahan' => $landCoverId,
+                'service_id'             => $validated['service_id'],
+                'method_id'              => $validated['method_id'],
+                'column_key'             => $validated['column_key'],
+            ],
+            array_merge(
+                $validated,
+                ['id_jenis_tutupan_lahan' => $landCoverId]
+            )
+        );
+
+        return response()->json([
+            'data'    => $column,
+            'message' => 'Kolom custom berhasil ditambahkan.',
+        ], Response::HTTP_CREATED);
+    }
+
+    /**
+     * PUT /v1/jenis-tutupan-lahan/{landCoverId}/valuation/custom-columns/{colId}
+     *
+     * Memperbarui definisi kolom custom berdasarkan database ID maupun column_key.
+     */
+    public function updateCustomColumn(Request $request, int $landCoverId, string|int $colId): JsonResponse
+    {
+        $this->findLandCover($landCoverId);
+
+        $strId = (string) $colId;
+        $query = ValuationCustomColumn::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId);
+
+        if (is_numeric($strId)) {
+            $query->where(function ($q) use ($strId) {
+                $q->where('id', (int) $strId)
+                  ->orWhere('column_key', $strId);
+            });
+        } else {
+            $query->where('column_key', $strId);
+        }
+
+        /** @var ValuationCustomColumn|null $column */
+        $column = $query->first();
+        if (!$column) {
+            return response()->json([
+                'message' => 'Kolom custom tidak ditemukan.',
+            ], Response::HTTP_NOT_FOUND);
+        }
+
+        $validated = $request->validate([
+            'label'       => ['nullable', 'string', 'max:200'],
+            'type'        => ['nullable', 'string', 'in:text,integer,decimal,date,boolean'],
+            'is_required' => ['nullable', 'boolean'],
+            'col_order'   => ['nullable', 'integer', 'min:0'],
+        ]);
+
+        $column->update($validated);
+
+        return response()->json([
+            'data'    => $column->refresh(),
+            'message' => 'Kolom custom berhasil diperbarui.',
+        ]);
+    }
+
+    /**
+     * DELETE /v1/jenis-tutupan-lahan/{landCoverId}/valuation/custom-columns/{colId}
+     *
+     * Menghapus definisi kolom custom berdasarkan database ID maupun column_key secara idempoten.
+     */
+    public function deleteCustomColumn(Request $request, int $landCoverId, string|int $colId): Response
+    {
+        $this->findLandCover($landCoverId);
+
+        $columnKey = $request->query('column_key', $request->input('column_key'));
+
+        $query = ValuationCustomColumn::query()
+            ->where('id_jenis_tutupan_lahan', $landCoverId);
+
+        $query->where(function ($q) use ($colId, $columnKey) {
+            $strId = (string) $colId;
+            if (is_numeric($strId)) {
+                $q->where('id', (int) $strId)
+                  ->orWhere('column_key', $strId);
+            } else {
+                $q->where('column_key', $strId);
+            }
+
+            if (!empty($columnKey)) {
+                $q->orWhere('column_key', (string) $columnKey);
+            }
+        });
+
+        $query->delete();
+
+        return response()->noContent();
+    }
+}
